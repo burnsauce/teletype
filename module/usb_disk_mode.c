@@ -26,7 +26,324 @@
 #include "usb_protocol_msc.h"
 
 
-void tele_usb_disk() {
+struct {
+    ud_menu_state_t state;
+    ud_menu_state_t last_state;
+    ud_scenes_t     flash_scenes;
+    ud_scenes_t     bank_scenes;
+    ud_banks_t      banks;
+   
+} menu;
+
+void init_menu() {
+    menu.state = UM_TOP;
+    menu.src_scenes = um_get_flash_scenes();
+    menu.banks = um_get_banks();
+}
+
+void um_get_flash_scenes(void) {
+    uint32_t sd = 0;
+    for (int i = 0; i < SCENE_SLOTS; i++)
+        if (!scene_is_empty(i))
+            sd = sd | (1 << i);
+    memcpy(&menu.flash_scenes, &sd, sizeof(sd));
+    if (!um_live_scene_is_empty())
+        menu.flash_scenes[5] = 1;
+}
+
+void um_get_bank_scenes(void) {
+    uint32_t sd = 0;
+    for (int i = 0; i < SCENE_SLOTS; i++)
+        if (um_bank_scene_exists(i))
+            sd = sd | (1 << i);
+    memcpy(&menu.bank_scenes, &sd, sizeof(sd));
+}
+
+
+void um_draw_flash_scene_selector(bool show_empty) {
+}
+
+void um_draw_bank_scene_selector(bool show_empty) {
+}
+
+void um_draw_bank_selector() {
+}
+
+void um_process_button_press() {
+    uint16_t selection;
+    
+    if (menu.state == UM_OK || menu.state == UM_ERROR) {
+        menu.state = menu.last_state;
+        return;
+    }
+
+    if (menu.state != UM_SAVE_CONFIM && menu.state != UM_LOAD_CONFIRM)
+        menu.last_state = state;
+
+    switch (menu.state) {
+        case UM_TOP:
+            /* Save
+             * Load
+             * Exit */
+            selection = um_knob_scale(3);
+            if (selection == 0)
+                menu.state = UM_SAVE;
+            else if (selection == 1)
+                menu.state = UM_LOAD;
+            else
+                um_exit();
+            break;
+
+        case UM_SAVE:
+            /* Bank
+             * Scene
+             * Back */
+            selection = um_knob_scale(3);
+            if (selection == 0)
+                menu.state = UM_SAVE_BANK;
+            else if (selection == 1)
+                menu.state = UM_SAVE_SRC_SCENE;
+            else
+                menu.state = UM_TOP;
+            break;
+
+        case UM_SAVE_BANK:
+            /* Selector: 1 to Bank Count
+             * New
+             * Back */
+            uint8_t count = um_get_bank_count();
+            selection = um_knob_scale(count + 2);
+            if (selection == count + 1) {
+                menu.state = UM_SAVE;
+                /* Easier to */ break; /* than to alter below logic */
+            }
+            
+            if (selection == count)
+                selection = um_new_bank();
+            else {
+                menu.state = UM_SAVE_CONFIRM;
+                break;
+            }
+
+            if(um_save_to_bank(selection))
+                menu.state = UM_OK;
+            else
+                menu.state = UM_ERROR;
+            break;
+
+        case UM_SAVE_SCENE_SRC:
+            /* Selector: 1 2 3 4 5 6 7 8 M I
+             * Back */
+            selection = um_knob_scale(11);
+            if (selection == 10)
+                menu.state = UM_SAVE;
+            else {
+                menu.src = selection;
+                menu.state = UM_SAVE_DST_SCENE;
+            }
+            break;
+
+        case UM_SAVE_SCENE_DST:
+            /* Selector: 1 2 3 4 5 6 7 8 M I
+             * Back */
+            selection = um_knob_scale(11);
+            if (selection == 10)
+                menu.state = UM_SAVE_SRC_SCENE;
+            else {
+                if (um_bank_scene_exists(selection)) {
+                    menu.dst = selection;
+                    menu.state = UM_SAVE_CONFIRM;
+                }
+                else {
+                    if (um_save_to_bank_scene(selection))
+                        menu.state = UM_OK;
+                    else
+                        menu.state = UM_ERROR;
+                }
+            }
+            break;
+
+        case UM_SAVE_CONFIRM:
+            /* Yes
+             * No */
+            selection = um_knob_scale(2);
+            if (selection == 0) {
+                if (um_save_to_bank_scene(selection))
+                    menu.state = UM_OK;
+                else
+                    menu.state = UM_ERROR;
+            }
+            else
+                menu.state = menu.last_state;
+            break;
+
+        case UM_LOAD:
+            /* Bank
+             * Scene
+             * Back */
+            selection = um_knob_scale(3);
+            if (selection == 0)
+                menu.state = UM_LOAD_BANK;
+            else if (selection == 1)
+                menu.state = UM_LOAD_SCENE_BANK;
+            else
+                menu.state = UM_TOP;
+            break;
+
+        case UM_LOAD_BANK:
+            /* Selector: 1 to last bank
+             * Back */
+            uint8_t count = um_get_bank_count();
+            selection = um_knob_scale(count + 1);
+            if (selection == count) {
+                menu.state = UM_LOAD;
+            else
+                menu.state = UM_LOAD_CONFIRM;
+            break;
+
+        case UM_LOAD_SCENE_BANK:
+            /* Selector: 1 to last bank
+             * Back */
+            uint8_t count = um_get_bank_count();
+            selection = um_knob_scale(count + 1);
+            if (selection == count)
+                menu.state = UM_LOAD_BANK;
+            else {
+                if(um_flash_bank_is_empty()) {
+                    if(um_load_bank(selection))
+                        menu.state = UM_OK;
+                    else
+                        menu.state = UM_ERROR;
+                }
+                else {
+                    menu.dst = selection;
+                    menu.state = UM_LOAD_CONFIRM;
+                }
+            }
+            break;
+
+        // AW FUCK!  This is for scripts, not scenes!
+        case UM_LOAD_SCENE_SRC:
+            /* Selector: 1 2 3 4 5 6 7 8 M I
+             * Back */
+            selection = um_knob_scale(11);
+            if (selection == 10)
+                menu.state = UM_LOAD_SCENE_BANK;
+            else {
+               menu.src = selection;
+               menu.state = UM_LOAD_SCENE_DST;
+            }
+            break;
+
+        case UM_LOAD_SCENE_DST:
+            /* Selector: 1 2 3 4 5 6 7 8 M 1
+             * Back */
+            selection = um_knob_scale(11);
+            if (selection == 10)
+                menu.state = UM_LOAD_SCENE_SRC;
+            else {
+                if(um_flash_scene_is_empty(selection)) {
+                    if(um_load_scene(menu.src, selection))
+                        menu.state = UM_OK;
+                    else
+                        menu.state = UM_ERROR;
+                }
+                else {
+                    menu.dst = selection
+
+            }
+            break;
+
+        case UM_LOAD_CONFIRM:
+            break;
+
+                
+        
+            
+       
+            
+
+
+            
+            
+}
+
+void display_usb_disk_menu() {
+    switch (menu.state) {
+        case UM_TOP:
+            // Display the top menu
+            break;
+
+        case UM_SAVE:
+            // Display the Save top menu
+            break;
+
+        case UM_SAVE_BANK:
+            draw_bank_selector();
+            break;
+
+        case UM_SAVE_SRC_SCENE:
+            draw_flash_scene_selector(false);
+            break;
+
+        case UM_SAVE_DST_BANK:
+            draw_bank_selector();
+            break;
+
+        case UM_SAVE_DST_SCENE:
+            draw_bank_scene_selector(true);
+            break;
+
+        case UM_SAVE_CONFIRM:
+            draw_save_confirm_dialog();
+            break;
+
+        case UM_LOAD:
+            // Display the Load top menu
+            break;
+
+        case UM_LOAD_BANK:
+            draw_bank_selector();
+            break;
+
+        case UM_LOAD_SCENE_BANK:
+            draw_bank_selector();
+            break;
+
+        case UM_LOAD_SCENE_SRC_SCENE:
+            draw_bank_scene_selector(false);
+            break;
+
+        case UM_LOAD_SCENE_DST_SCENE:
+            draw_flash_scene_selector(true);
+            break;
+        case UM_LOAD_CONFIRM:
+            draw_load_confirm_dialog();
+    }
+}
+
+
+bool tele_usb_disk() {
+    if ( !tele_usb_disk_mount() )
+        display_usb_disk_error();
+    else
+        display_usb_disk_menu();
+}
+
+bool tele_usb_disk_mount() {
+    nav_reset();
+    nav_select(0);
+
+    if (mount_drive()) {
+        find_banks();
+        return true;
+    }
+    
+    nav_exit();
+    return false;
+}
+
+void old_tele_usb_disk() {
     char input_buffer[32];
     print_dbg("\r\nusb");
 
