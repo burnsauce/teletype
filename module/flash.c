@@ -28,6 +28,10 @@ typedef const struct {
 
 static __attribute__((__section__(".flash_nvram"))) nvram_data_t f;
 
+nvram_data_t *get_flash() {
+    return &f;
+}
+
 void flash_prepare() {
     // if it's not empty return
     if (f.fresh == FIRSTRUN_KEY) return;

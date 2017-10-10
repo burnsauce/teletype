@@ -9,6 +9,19 @@
 
 #define SCENE_SLOTS 32
 
+// NVRAM data structure located in the flash array.
+typedef const struct {
+    scene_script_t scripts[SCRIPT_COUNT];
+    scene_pattern_t patterns[PATTERN_COUNT];
+    char text[SCENE_TEXT_LINES][SCENE_TEXT_CHARS];
+} nvram_scene_t;
+
+typedef const struct {
+    nvram_scene_t scenes[SCENE_SLOTS];
+    uint8_t last_scene;
+    uint8_t fresh;
+} nvram_data_t;
+
 void flash_prepare(void);
 void flash_read(uint8_t preset_no, scene_state_t *scene,
                 char (*text)[SCENE_TEXT_LINES][SCENE_TEXT_CHARS]);
