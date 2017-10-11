@@ -5,6 +5,10 @@
 #include "state.h"
 
 void tele_usb_disk(void);
+void process_usbdisk_button_press(bool);
+void process_usbdisk_knob(int32_t);
+bool screen_refresh_usbdisk(void);
+void set_usbdisk_mode(void);
 
 typedef enum {
     UM_TOP,
@@ -27,7 +31,7 @@ typedef enum {
 
 
 typedef struct {
-    uint8_t data[32];
+    uint32_t data[8];
 } ud_banks_t;
 
 typedef enum {
@@ -37,5 +41,6 @@ typedef enum {
 typedef struct {
     uint8_t data[5];
 } ud_scenes_t;
+
 
 #endif

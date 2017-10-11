@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
 
 // this
 #include "flash.h"
@@ -24,6 +26,7 @@
 #include "uhi_msc.h"
 #include "uhi_msc_mem.h"
 #include "usb_protocol_msc.h"
+#include "flashc.h"
 
 // Prototypes with no function written
 bool     ud_bank_scene_exists(uint8_t);
@@ -36,20 +39,18 @@ void     ud_get_banks(void);
 uint8_t  ud_get_flash_scene_count(void);
 void     ud_get_flash_scenes(void);
 uint8_t  ud_knob_scale(uint8_t);
-bool     ud_live_bank_is_empty(void);
 bool     ud_live_scene_is_empty(void);
 bool     ud_load_bank(uint8_t);
-bool     ud_load_scene(uint8_t);
-bool     ud_load_scene_from_disk(uint8_t, nvram_scene_t*);
+bool     ud_load_scene(void);
+bool     ud_load_scene_from_disk(uint8_t, clone_scene_t*);
 bool     ud_mount_drive(void);
 uint8_t  ud_new_bank_scene(void);
-void     ud_new_bank(void);
+bool     ud_new_bank(void);
 uint8_t  ud_new_flash_scene(void);
 bool     ud_save_bank(void);
 bool     ud_save_scene(void);
-bool     ud_select_bank(uint8_t);
-bool     ud_deserialize_scene(nvram_scene_t*);
-bool     ud_serialize_scene(void);
+bool     ud_deserialize_scene(clone_scene_t*);
+bool     ud_serialize_scene(nvram_scene_t*);
 
 // Draw routine prototypes
 void ud_draw_flash_scene_selector(bool);
@@ -60,33 +61,38 @@ void ud_draw_load_bank_confirm_dialog(void);
 void ud_draw_load_confirm_dialog(void);
 void ud_draw_ok_popup(void);
 void ud_draw_error_popup(void);
-void ud_display_error(void);
-void ud_display_menu(void);
 
-// Interface
+// Done
 void ud_init_menu(void);
 void ud_get_flash_scenes(void);
 void ud_get_bank_scenes(void);
-void ud_process_button_press(void);
 void ud_popup_timeout(void);
 bool ud_init(void);
 void ud_make_path(uint8_t);
+void ud_make_path_bank(bool);
+uint8_t ud_next_bank_number(void);
+bool ud_flash_bank_is_empty(void);
+uint8_t ud_flash_scene_count(void);
+void ud_select_bank(uint8_t);
 
-// State
+// File Variables
 
 struct ud_menu {
+    bool             invalid;
     ud_menu_state_t  state;
     ud_menu_state_t  last_state;
     ud_scenes_t      flash_scenes;
-    ud_scenes_t      bank_scenes;
+    uint32_t         bank_scenes;
     ud_banks_t       banks;
     uint8_t          bank;
     ud_scene_t       src;
     ud_scene_t       dst;
-    nvram_scene_t    blank;
+    clone_scene_t    blank;
 } menu;
 
 static nvram_data_t *fp;
+static uint32_t knob_last = 0;
+static bool dirty = false;
 
 // Helper Macros
 #define INLINE inline
@@ -101,6 +107,7 @@ static nvram_data_t *fp;
 #define ud_bank_scene_exists(slot) \
     ud_load_scene_from_disk(slot, NULL)
 
+
 #else
 
 INLINE bool ud_flash_scene_is_empty(uint8_t slot) {
@@ -114,20 +121,67 @@ INLINE bool ud_bank_scene_exists(uint8_t slot) {
 
 #endif
 
+uint8_t ud_knob_scale(uint8_t s) {
+    uint32_t t = knob_last << 1;
+    t *= s;
+    t /= 16384;
+    t += 1;
+    t = t >> 1;
+    return (uint8_t)t;
+}
+
+// Flash access
+
 bool ud_live_scene_is_empty(void) {
-    nvram_scene_t s;
+    clone_scene_t s;
     memcpy(&s.scripts, ss_scripts_ptr(&scene_state),
             ss_scripts_size());
     memcpy(&s.patterns, ss_patterns_ptr(&scene_state),
             ss_patterns_size());
     // Text not stored in live scene
-    return memcmp(&menu.blank, &s, sizeof(nvram_scene_t)) == 0;
+    return memcmp(&menu.blank, &s, sizeof(clone_scene_t)) == 0;
 }
 
+bool ud_flash_bank_is_empty(void) {
+    for(int i = 0; i < SCENE_SLOTS; i++)
+        if (!ud_flash_scene_is_empty(i))
+            return false;
+    return true;
+}
+
+uint8_t ud_get_flash_scene_count(void) {
+    uint8_t count = 0;
+    for(int i = 0; i < SCENE_SLOTS; i++)
+        if (!ud_flash_scene_is_empty(i))
+            count++;
+    return count;
+}
+
+uint8_t ud_new_flash_scene(void) {
+    for(int i = 0; i < SCENE_SLOTS; i++)
+        if (ud_flash_scene_is_empty(i))
+            return i;
+    // Error
+    return 31;
+}
+
+void ud_get_flash_scenes(void) {
+    uint8_t slot = 0;
+    for (int i = 0; i < SCENE_SLOTS; i++) {
+        if (slot % 8 == 0 && i != 0)
+            slot++;
+        if (!ud_flash_scene_is_empty(i))
+            menu.flash_scenes.data[slot] |= (1 << (i % 8));
+    }
+    if (!ud_live_scene_is_empty())
+        menu.flash_scenes.data[4] = 1;
+}
+
+// USB Bank access
 static char ud_path[] = "/teletype/bank_000/scene_00.txt";
 //                       0123456789012345678901234567890
 
-void ud_make_path(uint8_t slot) {
+void ud_make_path_bank(bool terminate) {
     if (menu.bank > 100)
         itoa(menu.bank / 100, &ud_path[15], 1);
     else
@@ -137,15 +191,23 @@ void ud_make_path(uint8_t slot) {
     else
         ud_path[16] = '0';
     itoa(menu.bank % 10, &ud_path[17], 1);
-
-    if (slot >= 10)
-        itoa(slot / 10, &ud_path[25], 1);
+    if (terminate)
+        ud_path[19] = '\0';
     else
-        ud_path[25] = '0';
-    itoa(slot % 10, &ud_path[26], 1);
+        ud_path[19] = 's';
 }
 
-bool ud_load_scene_from_disk(uint8_t slot, nvram_scene_t *s) {
+void ud_make_path(uint8_t scene) {
+    ud_make_path_bank(false);
+
+    if (scene >= 10)
+        itoa(scene / 10, &ud_path[25], 1);
+    else
+        ud_path[25] = '0';
+    itoa(scene % 10, &ud_path[26], 1);
+}
+
+bool ud_load_scene_from_disk(uint8_t slot, clone_scene_t *s) {
     ud_make_path(slot);
 
     if (!nav_setcwd((FS_STRING)ud_path, true, false))
@@ -171,9 +233,20 @@ bool ud_save_scene(void) {
     if (!file_open(FOPEN_MODE_W))
         return false;
 
-    bool ret = ud_serialize_scene();
+    bool ret = ud_serialize_scene(&fp->scenes[menu.src]);
     file_close();
 
+    return ret;
+}
+
+bool ud_save_bank(void) {
+    bool ret = true;
+    for (uint8_t i = 0; i < 32; i++) {
+        menu.src = i;
+        menu.dst = i;
+        if (!ud_save_scene())
+            ret = false;
+    }
     return ret;
 }
 
@@ -190,41 +263,133 @@ void ud_get_banks(void) {
         }
         nav_filelist_set(1, FS_FIND_NEXT);
     }
+    nav_filelist_single_disable();
 }
+
+void ud_get_bank_scenes(void) {
+    ud_make_path_bank(true);
+    nav_setcwd((FS_STRING)ud_path, true, true);
+    nav_filelist_single_enable(FS_FILE);
+    
+
+    char buf[14];
+    while (!nav_filelist_eol()) {
+        nav_file_getname((FS_STRING)buf, 13);
+        if (strncmp("scene_", buf, 6) == 0 && strncmp(".txt", &buf[9], 4) == 0) {
+            uint8_t scene = atoi(&buf[6]);
+            menu.bank_scenes |= (1 << scene);
+        }
+        nav_filelist_set(1, FS_FIND_NEXT);
+    }
+    nav_filelist_single_disable();
+}
+
+uint8_t ud_get_bank_scene_count(void) {
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < 32; i++) {
+        if ((menu.bank_scenes >> i) & 1)
+            count++;
+    }
+    return count;
+}
+
+static bool ud_banks_full = false;
+
+uint8_t ud_next_bank_number(void) {
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 32; j++)
+            if (!((menu.banks.data[i] >> j) & 1))
+                return 32 * i + j;
+    ud_banks_full = true;
+    return UINT8_MAX; // technically an error
+}
+
+uint8_t ud_get_bank_count(void) {
+    uint8_t count = 0;
+
+    for (int i = 0; i < 8; i++)
+        for (int j=0; j < 32; j++)
+            if ((menu.banks.data[i] >> j) & 1)
+                count++;
+    return count;
+}
+
+bool ud_new_bank(void) {
+    uint8_t bank = ud_next_bank_number();
+    if (ud_banks_full)
+        return false;
+    ud_select_bank(bank);
+    return true;
+}
+
+void ud_select_bank(uint8_t bank) {
+    menu.bank = bank;
+    ud_make_path_bank(true);
+    nav_setcwd((FS_STRING)ud_path, true, true);
+    ud_get_bank_scenes();
+}
+
+bool ud_load_scene(void) {
+    clone_scene_t s;
+    if(!ud_load_scene_from_disk(menu.src, &s))
+        return false;
+    flashc_memcpy((void *)&fp->scenes[menu.dst], &s, sizeof(clone_scene_t), true);
+    return true;
+}
+
+bool ud_load_bank(uint8_t bank) {
+    ud_select_bank(bank);
+    for (uint8_t i = 0; i < 32; i++) {
+        menu.src = i;
+        menu.dst = i;
+        if (!ud_load_scene())
+            flashc_memcpy((void *)&fp->scenes[menu.dst], &menu.blank, sizeof(nvram_scene_t), true);
+    }
+    return true;
+}
+
+uint8_t ud_new_bank_scene() {
+    for (int i = 0; i < 32; i++)
+        if (((menu.bank_scenes >> i) & 1) == 0)
+            return i;
+    return 31;
+}
+
+bool ud_mount_drive(void) {
+    if (!uhi_msc_is_available())
+        return false;
+    for (int i = 0; i < uhi_msc_get_lun(); i++)
+        if (nav_drive_set(i))
+            if (nav_partition_mount())
+                return true;
+    return false;
+}
+
+// Control flow
 
 void ud_init_menu(void) {
     menu.state = UM_TOP;
     menu.bank = 0;
-    ud_get_flash_scenes();
-    ud_get_banks();
-    memset((void *)&menu.blank, 0, sizeof(nvram_scene_t));
+    memset((void *)&menu.blank, 0, sizeof(clone_scene_t));
 }
 
 void ud_exit(void) {
     nav_exit();
+    exit_usb_mode();
+    set_last_mode();
 }
 
-void ud_get_flash_scenes(void) {
-    uint8_t slot = 0;
-    for (int i = 0; i < SCENE_SLOTS; i++) {
-        if (slot % 8 == 0 && i != 0)
-            slot++;
-        if (!ud_flash_scene_is_empty(i))
-            menu.flash_scenes.data[slot] |= (1 << (i % 8));
+void process_usbdisk_knob(int32_t knob_value) {
+    if (knob_value != knob_last) {
+        knob_last = knob_value;
+        dirty = true;
     }
-    if (!ud_live_scene_is_empty())
-        menu.flash_scenes.data[4] = 1;
 }
 
-void ud_get_bank_scenes(void) {
-    uint32_t sd = 0;
-    for (int i = 0; i < SCENE_SLOTS; i++)
-        if (ud_bank_scene_exists(i))
-            sd = sd | (1 << i);
-    memcpy(&menu.bank_scenes, &sd, sizeof(sd));
-}
-
-void ud_process_button_press(void) {
+void process_usbdisk_button_press(bool held) {
+    if (held == true)
+        return;
+    
     uint16_t selection;
     uint8_t count;
     
@@ -367,7 +532,7 @@ void ud_process_button_press(void) {
             if (selection == count)
                 menu.state = UM_LOAD;
             else {
-                if (ud_live_bank_is_empty()) {
+                if (ud_flash_bank_is_empty()) {
                     if (ud_load_bank(selection))
                         menu.state = UM_OK;
                     else
@@ -427,8 +592,8 @@ void ud_process_button_press(void) {
             if (selection == count + 1)
                 menu.state = UM_LOAD_SCENE_SRC;
             else if (selection == count) {
-                selection = ud_new_flash_scene();
-                if(ud_load_scene(selection))
+                menu.dst = ud_new_flash_scene();
+                if(ud_load_scene())
                     menu.state = UM_OK;
                 else
                     menu.state = UM_ERROR;
@@ -443,7 +608,7 @@ void ud_process_button_press(void) {
             /* Yes
              * No */
             selection = ud_knob_scale(2);
-            if (ud_load_scene(selection))
+            if (ud_load_scene())
                 menu.state = UM_OK;
             else
                 menu.state = UM_ERROR;
@@ -454,13 +619,21 @@ void ud_process_button_press(void) {
             menu.state = menu.last_state;
             break;
     }
+    dirty = true;
 }
 
 void ud_popup_timeout(void) {
+    if (menu.invalid)
+        ud_exit();
     menu.state = menu.last_state;
+    dirty = true;
 }
 
-void ud_display_menu(void) {
+
+bool screen_refresh_usbdisk(void) {
+    if (!dirty)
+        return false;
+
     switch (menu.state) {
         case UM_TOP:
             // Display the top menu
@@ -526,13 +699,15 @@ void ud_display_menu(void) {
             ud_draw_error_popup();
             break;
     }
+    dirty = false;
+    return true;
 }
 
-void tele_usb_disk(void) {
-    if ( !ud_init() )
-        ud_display_error();
-    else
-        ud_display_menu();
+void set_usbdisk_mode(void) {
+    if ( !ud_init() ) {
+        menu.state = UM_ERROR;
+        menu.invalid = true;
+    }
 }
 
 bool ud_init(void) {
@@ -541,6 +716,7 @@ bool ud_init(void) {
     nav_reset();
     nav_select(0);
 
+    ud_get_flash_scenes();
     if (ud_mount_drive()) {
         ud_get_banks();
         return true;
@@ -549,375 +725,354 @@ bool ud_init(void) {
     return false;
 }
 
-void old_tele_usb_disk(void) {
-    char input_buffer[32];
-    print_dbg("\r\nusb");
+bool ud_serialize_scene(nvram_scene_t *scene) {
+    if (!file_open(FOPEN_MODE_W)) {
+        print_dbg("\r\nfail");
+        return false;
+    }
 
-    uint8_t lun_state = 0;
-
-    for (uint8_t lun = 0; (lun < uhi_msc_mem_get_lun()) && (lun < 8); lun++) {
-        // print_dbg("\r\nlun: ");
-        // print_dbg_ulong(lun);
-
-        // Mount drive
-        nav_drive_set(lun);
-        if (!nav_partition_mount()) {
-            if (fs_g_status == FS_ERR_HW_NO_PRESENT) {
-                // The test can not be done, if LUN is not present
-                lun_state &= ~(1 << lun);  // LUN test reseted
-                continue;
-            }
-            lun_state |= (1 << lun);  // LUN test is done.
-            print_dbg("\r\nfail");
-            // ui_test_finish(false); // Test fail
-            continue;
+    char blank = 0;
+    for (int l = 0; l < SCENE_TEXT_LINES; l++) {
+        if (strlen(scene->text[l])) {
+            file_write_buf((uint8_t*)scene->text[l], strlen(scene->text[l]));
+            file_putc('\n');
+            blank = 0;
         }
-        // Check if LUN has been already tested
-        if (lun_state & (1 << lun)) { continue; }
-
-        // WRITE SCENES
-        char filename[13];
-        strcpy(filename, "tt00s.txt");
-
-        print_dbg("\r\nwriting scenes");
-        strcpy(input_buffer, "WRITE");
-        region_fill(&line[0], 0);
-        font_string_region_clip_tab(&line[0], input_buffer, 2, 0, 0xa, 0);
-        region_draw(&line[0]);
-
-        for (int i = 0; i < SCENE_SLOTS; i++) {
-            scene_state_t scene;
-            ss_init(&scene);
-
-            char text[SCENE_TEXT_LINES][SCENE_TEXT_CHARS];
-            memset(text, 0, SCENE_TEXT_LINES * SCENE_TEXT_CHARS);
-
-            strcat(input_buffer, ".");
-            region_fill(&line[0], 0);
-            font_string_region_clip_tab(&line[0], input_buffer, 2, 0, 0xa, 0);
-            region_draw(&line[0]);
-
-            flash_read(i, &scene, &text);
-
-            if (!nav_file_create((FS_STRING)filename)) {
-                if (fs_g_status != FS_ERR_FILE_EXIST) {
-                    if (fs_g_status == FS_LUN_WP) {
-                        // Test can be done only on no write protected
-                        // device
-                        continue;
-                    }
-                    lun_state |= (1 << lun);  // LUN test is done.
-                    print_dbg("\r\nfail");
-                    continue;
-                }
-            }
-            if (!file_open(FOPEN_MODE_W)) {
-                if (fs_g_status == FS_LUN_WP) {
-                    // Test can be done only on no write protected
-                    // device
-                    continue;
-                }
-                lun_state |= (1 << lun);  // LUN test is done.
-                print_dbg("\r\nfail");
-                continue;
-            }
-
-            char blank = 0;
-            for (int l = 0; l < SCENE_TEXT_LINES; l++) {
-                if (strlen(text[l])) {
-                    file_write_buf((uint8_t*)text[l], strlen(text[l]));
-                    file_putc('\n');
-                    blank = 0;
-                }
-                else if (!blank) {
-                    file_putc('\n');
-                    blank = 1;
-                }
-            }
-
-            char input[36];
-            for (int s = 0; s < 10; s++) {
-                file_putc('\n');
-                file_putc('\n');
-                file_putc('#');
-                if (s == 8)
-                    file_putc('M');
-                else if (s == 9)
-                    file_putc('I');
-                else
-                    file_putc(s + 49);
-
-                for (int l = 0; l < ss_get_script_len(&scene, s); l++) {
-                    file_putc('\n');
-                    print_command(ss_get_script_command(&scene, s, l), input);
-                    file_write_buf((uint8_t*)input, strlen(input));
-                }
-            }
-
+        else if (!blank) {
             file_putc('\n');
-            file_putc('\n');
-            file_putc('#');
-            file_putc('P');
-            file_putc('\n');
-
-            for (int b = 0; b < 4; b++) {
-                itoa(ss_get_pattern_len(&scene, b), input, 10);
-                file_write_buf((uint8_t*)input, strlen(input));
-                if (b == 3)
-                    file_putc('\n');
-                else
-                    file_putc('\t');
-            }
-
-            for (int b = 0; b < 4; b++) {
-                itoa(ss_get_pattern_wrap(&scene, b), input, 10);
-                file_write_buf((uint8_t*)input, strlen(input));
-                if (b == 3)
-                    file_putc('\n');
-                else
-                    file_putc('\t');
-            }
-
-            for (int b = 0; b < 4; b++) {
-                itoa(ss_get_pattern_start(&scene, b), input, 10);
-                file_write_buf((uint8_t*)input, strlen(input));
-                if (b == 3)
-                    file_putc('\n');
-                else
-                    file_putc('\t');
-            }
-
-            for (int b = 0; b < 4; b++) {
-                itoa(ss_get_pattern_end(&scene, b), input, 10);
-                file_write_buf((uint8_t*)input, strlen(input));
-                if (b == 3)
-                    file_putc('\n');
-                else
-                    file_putc('\t');
-            }
-
-            file_putc('\n');
-
-            for (int l = 0; l < 64; l++) {
-                for (int b = 0; b < 4; b++) {
-                    itoa(ss_get_pattern_val(&scene, b, l), input, 10);
-                    file_write_buf((uint8_t*)input, strlen(input));
-                    if (b == 3)
-                        file_putc('\n');
-                    else
-                        file_putc('\t');
-                }
-            }
-
-            file_close();
-            lun_state |= (1 << lun);  // LUN test is done.
-
-            if (filename[3] == '9') {
-                filename[3] = '0';
-                filename[2]++;
-            }
-            else
-                filename[3]++;
-
-            print_dbg(".");
-        }
-
-        nav_filelist_reset();
-
-
-        // READ SCENES
-        strcpy(filename, "tt00.txt");
-        print_dbg("\r\nreading scenes...");
-
-        strcpy(input_buffer, "READ");
-        region_fill(&line[1], 0);
-        font_string_region_clip_tab(&line[1], input_buffer, 2, 0, 0xa, 0);
-        region_draw(&line[1]);
-
-        for (int i = 0; i < SCENE_SLOTS; i++) {
-            scene_state_t scene;
-            ss_init(&scene);
-            char text[SCENE_TEXT_LINES][SCENE_TEXT_CHARS];
-            memset(text, 0, SCENE_TEXT_LINES * SCENE_TEXT_CHARS);
-
-            strcat(input_buffer, ".");
-            region_fill(&line[1], 0);
-            font_string_region_clip_tab(&line[1], input_buffer, 2, 0, 0xa, 0);
-            region_draw(&line[1]);
-            if (nav_filelist_findname(filename, 0)) {
-                print_dbg("\r\nfound: ");
-                print_dbg(filename);
-                if (!file_open(FOPEN_MODE_R))
-                    print_dbg("\r\ncan't open");
-                else {
-                    char c;
-                    uint8_t l = 0;
-                    uint8_t p = 0;
-                    int8_t s = 99;
-                    uint8_t b = 0;
-                    uint16_t num = 0;
-                    int8_t neg = 1;
-
-                    char input[32];
-                    memset(input, 0, sizeof(input));
-
-                    while (!file_eof() && s != -1) {
-                        c = toupper(file_getc());
-                        // print_dbg_char(c);
-
-                        if (c == '#') {
-                            if (!file_eof()) {
-                                c = toupper(file_getc());
-                                // print_dbg_char(c);
-
-                                if (c == 'M')
-                                    s = 8;
-                                else if (c == 'I')
-                                    s = 9;
-                                else if (c == 'P')
-                                    s = 10;
-                                else {
-                                    s = c - 49;
-                                    if (s < 0 || s > 7) s = -1;
-                                }
-
-                                l = 0;
-                                p = 0;
-
-                                if (!file_eof()) c = toupper(file_getc());
-                            }
-                            else
-                                s = -1;
-
-                            // print_dbg("\r\nsection: ");
-                            // print_dbg_ulong(s);
-                        }
-                        // SCENE TEXT
-                        else if (s == 99) {
-                            if (c == '\n') {
-                                l++;
-                                p = 0;
-                            }
-                            else {
-                                if (l < SCENE_TEXT_LINES &&
-                                    p < SCENE_TEXT_CHARS) {
-                                    text[l][p] = c;
-                                    p++;
-                                }
-                            }
-                        }
-                        // SCRIPTS
-                        else if (s >= 0 && s <= 9) {
-                            if (c == '\n') {
-                                if (p && l < SCRIPT_MAX_COMMANDS) {
-                                    tele_command_t temp;
-                                    error_t status;
-                                    char error_msg[TELE_ERROR_MSG_LENGTH];
-                                    status = parse(input, &temp, error_msg);
-
-                                    if (status == E_OK) {
-                                        status = validate(&temp, error_msg);
-
-                                        if (status == E_OK) {
-                                            ss_overwrite_script_command(
-                                                &scene, s, l, &temp);
-                                            l++;
-                                        }
-                                        else {
-                                            print_dbg("\r\nvalidate: ");
-                                            print_dbg(tele_error(status));
-                                            print_dbg(" >> ");
-                                            print_dbg("\r\nINPUT: ");
-                                            print_dbg(input);
-                                        }
-                                    }
-                                    else {
-                                        print_dbg("\r\nERROR: ");
-                                        print_dbg(tele_error(status));
-                                        print_dbg(" >> ");
-                                        print_dbg("\r\nINPUT: ");
-                                        print_dbg(input);
-                                    }
-
-                                    memset(input, 0, sizeof(input));
-                                    p = 0;
-                                }
-                            }
-                            else {
-                                if (p < 32) input[p] = c;
-                                p++;
-                            }
-                        }
-                        // PATTERNS
-                        // tele_patterns[]. l wrap start end v[64]
-                        else if (s == 10) {
-                            if (c == '\n' || c == '\t') {
-                                if (b < 4) {
-                                    if (l > 3) {
-                                        ss_set_pattern_val(&scene, b, l - 4,
-                                                           neg * num);
-                                        // print_dbg("\r\nset: ");
-                                        // print_dbg_ulong(b);
-                                        // print_dbg(" ");
-                                        // print_dbg_ulong(l-4);
-                                        // print_dbg(" ");
-                                        // print_dbg_ulong(num);
-                                    }
-                                    else if (l == 0) {
-                                        ss_set_pattern_len(&scene, b, num);
-                                    }
-                                    else if (l == 1) {
-                                        ss_set_pattern_wrap(&scene, b, num);
-                                    }
-                                    else if (l == 2) {
-                                        ss_set_pattern_start(&scene, b, num);
-                                    }
-                                    else if (l == 3) {
-                                        ss_set_pattern_end(&scene, b, num);
-                                    }
-                                }
-
-                                b++;
-                                num = 0;
-                                neg = 1;
-
-                                if (c == '\n') {
-                                    if (p) l++;
-                                    if (l > 68) s = -1;
-                                    b = 0;
-                                    p = 0;
-                                }
-                            }
-                            else {
-                                if (c == '-')
-                                    neg = -1;
-                                else if (c >= '0' && c <= '9') {
-                                    num = num * 10 + (c - 48);
-                                    // print_dbg("\r\nnum: ");
-                                    // print_dbg_ulong(num);
-                                }
-                                p++;
-                            }
-                        }
-                    }
-
-
-                    file_close();
-
-                    flash_write(i, &scene, &text);
-                }
-            }
-
-            nav_filelist_reset();
-
-            if (filename[3] == '9') {
-                filename[3] = '0';
-                filename[2]++;
-            }
-            else
-                filename[3]++;
+            blank = 1;
         }
     }
 
-    nav_exit();
+    char input[36];
+    for (int s = 0; s < 10; s++) {
+        file_putc('\n');
+        file_putc('\n');
+        file_putc('#');
+        if (s == 8)
+            file_putc('M');
+        else if (s == 9)
+            file_putc('I');
+        else
+            file_putc(s + '0');
+
+        int line = 0;
+        for (int l = 0; l < scene->scripts[s].l; l++) {
+            file_putc('\n');
+            print_command(&scene->scripts[s].c[l], input);
+            file_write_buf((uint8_t*)input, strlen(input));
+            line++;
+            if (line >= SCRIPT_MAX_COMMANDS)
+                break;
+        }
+    }
+
+    file_putc('\n');
+    file_putc('\n');
+    file_putc('#');
+    file_putc('P');
+    file_putc('\n');
+
+    for (int b = 0; b < 4; b++) {
+        itoa(scene->patterns[b].len, input, 10);
+        file_write_buf((uint8_t*)input, strlen(input));
+        if (b == 3)
+            file_putc('\n');
+        else
+            file_putc('\t');
+    }
+
+    for (int b = 0; b < 4; b++) {
+        itoa(scene->patterns[b].wrap, input, 10);
+        file_write_buf((uint8_t*)input, strlen(input));
+        if (b == 3)
+            file_putc('\n');
+        else
+            file_putc('\t');
+    }
+
+    for (int b = 0; b < 4; b++) {
+        itoa(scene->patterns[b].start, input, 10);
+        file_write_buf((uint8_t*)input, strlen(input));
+        if (b == 3)
+            file_putc('\n');
+        else
+            file_putc('\t');
+    }
+
+    for (int b = 0; b < 4; b++) {
+        itoa(scene->patterns[b].end, input, 10);
+        file_write_buf((uint8_t*)input, strlen(input));
+        if (b == 3)
+            file_putc('\n');
+        else
+            file_putc('\t');
+    }
+
+    file_putc('\n');
+
+    for (int l = 0; l < 64; l++) {
+        for (int b = 0; b < 4; b++) {
+            itoa(scene->patterns[b].val[l], input, 10);
+            file_write_buf((uint8_t*)input, strlen(input));
+            if (b == 3)
+                file_putc('\n');
+            else
+                file_putc('\t');
+        }
+    }
+
+    file_close();
+    return true;
+}
+
+#define BUFSIZE 8192 // 8k should hold any script in text, hopefully
+
+typedef enum {
+    _EXPECT_TEXT,
+    _EXPECT_SECTION,
+    _EXPECT_COMMAND,
+    _EXPECT_PATTERN_HEADER,
+    _EXPECT_PATTERN_DATA
+} _temp_parser_t;
+
+#define _CONT (end < bp)
+
+uint8_t _find_eol(char *, char **l);
+uint8_t _find_eol(char *p, char **eol) {
+    char *cr = strstr("\r", p);
+    char *lf = strstr("\n", p);
+
+    if (cr == NULL && lf != NULL)
+        *eol = lf - 1;
+    else if (lf == NULL && cr != NULL)
+        *eol = cr - 1;
+    else if (lf != NULL && cr != NULL) {
+        if (cr > lf)
+            *eol = lf - 1;
+        else
+            *eol = cr - 1;
+    }
+    else
+        *eol = NULL;
+
+    return (cr != NULL) + (lf != NULL);
+}
+
+
+bool ud_deserialize_scene(clone_scene_t *scene) {
+    if (!file_open(FOPEN_MODE_R)) {
+        print_dbg("\r\ncan't open");
+        return false;
+    }
+
+    tele_command_t cmd;
+    error_t status;
+    char error_msg[TELE_ERROR_MSG_LENGTH];
+    char buf[BUFSIZE];
+    char *endl, *temp;
+    uint16_t len;
+    uint8_t line = 0, crlf, script;
+
+    uint16_t bytesread = file_read_buf((uint8_t *)buf, BUFSIZE);
+    file_close();
+
+    _temp_parser_t state = _EXPECT_TEXT;
+
+    for (char *bp = buf, *end = buf + bytesread; _CONT; ) {
+        switch (state) {
+            case _EXPECT_TEXT:
+                while(*bp != '#' && _CONT && state != _EXPECT_SECTION) {
+                    
+                    crlf = _find_eol(bp, &endl);
+                    
+                    if (endl == NULL)
+                        return false;
+
+                    len = endl - bp + 1;
+
+                    if (len > SCENE_TEXT_CHARS) {
+                        len = SCENE_TEXT_CHARS;
+                        memcpy(&scene->text[line], bp, len);
+                        bp += len;
+                    }
+                    else {
+                        memcpy(&scene->text[line], bp, len);
+                        bp = endl + crlf;
+                    }
+
+                    if (++line >= SCENE_TEXT_LINES)
+                        state = _EXPECT_SECTION;
+                }
+                if (!_CONT)
+                    return false;
+                // no break to cause fall through, as we found a # or ran out of text space
+                
+            case _EXPECT_SECTION:
+                while(*bp != '#' && _CONT)
+                    bp++;
+                if (!_CONT)
+                    return false;
+
+                script = toupper(*(bp++));
+                
+                if (!(isdigit(script) || script == 'I' || script == 'M'))
+                    break; // keep looking for a section
+
+                crlf = _find_eol(bp, &endl);
+                bp = endl + crlf + 1;
+                line = 0;
+                if (script == 'P')
+                    state = _EXPECT_PATTERN_HEADER;
+                else
+                    state = _EXPECT_COMMAND;
+                break;
+
+            case _EXPECT_COMMAND:
+                crlf = _find_eol(bp, &endl);
+                if (endl == NULL)
+                    continue;
+                temp = strstr(bp, "#");
+
+                if (temp != NULL && endl > temp) {
+                    bp = temp;
+                    state = _EXPECT_SECTION;
+                    break;
+                }
+
+                *(endl + 1) = 0;
+                status = parse(bp, &cmd, error_msg);
+
+                if (status == E_OK) {
+                    status = validate(&cmd, error_msg);
+
+                    if (status == E_OK) {
+                        memcpy(&scene->scripts[line].c, &cmd, sizeof(cmd));
+                        line++;
+                        if (line >= SCRIPT_MAX_COMMANDS)
+                            state = _EXPECT_SECTION;
+
+                    }
+                    else {
+                        print_dbg("\r\nvalidate: ");
+                        print_dbg(tele_error(status));
+                        print_dbg(" >> ");
+                        print_dbg("\r\nINPUT: ");
+                        print_dbg(bp);
+                    }
+                }
+                else {
+                    print_dbg("\r\nERROR: ");
+                    print_dbg(tele_error(status));
+                    print_dbg(" >> ");
+                    print_dbg("\r\nINPUT: ");
+                    print_dbg(bp);
+                }
+                
+                bp = endl + crlf + 1;
+                break;
+
+            case _EXPECT_PATTERN_HEADER:
+
+                crlf = _find_eol(bp, &endl);
+                if (endl == NULL) {
+                    state = _EXPECT_SECTION;
+                    break;
+                }
+
+                if (bp == endl) {
+                    bp += crlf;
+                    break;
+                }
+
+                *(endl + 1) = 0;
+                if (sscanf(bp, "%" SCNu16 "\t%" SCNu16 "\t%" SCNu16 "\t%" SCNu16,
+                            &scene->patterns[0].len,
+                            &scene->patterns[1].len,
+                            &scene->patterns[2].len,
+                            &scene->patterns[3].len) == 4) {
+
+                    bp = endl + crlf + 1;
+                    crlf = _find_eol(bp, &endl);
+                    if (endl == NULL) {
+                        state = _EXPECT_SECTION;
+                        break;
+                    }
+
+                    *(endl + 1) = 0;
+                    if (sscanf(bp, "%" SCNu16 "\t%" SCNu16 "\t%" SCNu16 "\t%" SCNu16,
+                                &scene->patterns[0].wrap,
+                                &scene->patterns[1].wrap,
+                                &scene->patterns[2].wrap,
+                                &scene->patterns[3].wrap) == 4) {
+
+                        bp = endl + crlf + 1;
+                        crlf = _find_eol(bp, &endl);
+                        if (endl == NULL) {
+                            state = _EXPECT_SECTION;
+                            break;
+                        }
+
+                        *(endl + 1) = 0;
+                        if (sscanf(bp, "%" SCNu16 "\t%" SCNu16 "\t%" SCNu16 "\t%" SCNu16,
+                                    &scene->patterns[0].start,
+                                    &scene->patterns[1].start,
+                                    &scene->patterns[2].start,
+                                    &scene->patterns[3].start) == 4) {
+
+                            bp = endl + crlf + 1;
+                            crlf = _find_eol(bp, &endl);
+                            if (endl == NULL) {
+                                state = _EXPECT_SECTION;
+                                break;
+                            }
+
+                            *(endl + 1) = 0;
+                            if (sscanf(bp, "%" SCNu16 "\t%" SCNu16 "\t%" SCNu16 "\t%" SCNu16,
+                                        &scene->patterns[0].end,
+                                        &scene->patterns[1].end,
+                                        &scene->patterns[2].end,
+                                        &scene->patterns[3].end) == 4) {
+                            }
+                        }
+                    }
+                }
+
+                state = _EXPECT_PATTERN_DATA;
+                line = 0;
+
+                bp = endl + crlf + 1;
+                break;
+
+            case _EXPECT_PATTERN_DATA:
+                crlf = _find_eol(bp, &endl);
+                if (endl == NULL) {
+                    state = _EXPECT_SECTION;
+                    break;
+                }
+
+                if (bp == endl) {
+                    bp += crlf;
+                    break;
+                }
+
+                *(endl + 1) = 0;
+                if (sscanf(bp, "%" SCNu16 "\t%" SCNu16 "\t%" SCNu16 "\t%" SCNu16,
+                            &scene->patterns[0].val[line],
+                            &scene->patterns[1].val[line],
+                            &scene->patterns[2].val[line],
+                            &scene->patterns[3].val[line]) == 4)
+                    line++;
+
+                if (line == 64) {
+                    state = _EXPECT_SECTION;
+                    line = 0;
+                }
+
+                bp = endl + crlf + 1;
+                break;
+        }
+    }
+
+    return true;
 }

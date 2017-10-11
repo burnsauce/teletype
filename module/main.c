@@ -262,7 +262,10 @@ void handler_Front(int32_t data) {
         set_last_mode();
         return;
     }
-    if (data == 0) {
+    if (mode == M_USB_DISK) {
+        process_usbdisk_button_press(data == 0);
+    }
+    else if (data == 0) {
         if (mode != M_PRESET_R) {
             front_timer = 0;
             set_preset_r_mode(adc[1]);
@@ -300,6 +303,9 @@ void handler_PollADC(int32_t data) {
     }
     else if (mode == M_PRESET_R) {
         process_preset_r_knob(adc[1], mod_key);
+    }
+    else if (mode == M_USB_DISK) {
+        process_usbdisk_knob(adc[1]);
     }
     else {
         ss_set_param(&scene_state, adc[1] << 2);
@@ -363,22 +369,25 @@ void handler_HidTimer(int32_t data) {
     hid_clear_frame_dirty();
 }
 
+static u8 flags;
+
 void handler_MscConnect(int32_t data) {
     // disable event handlers while doing USB write
     assign_msc_event_handlers();
 
     // disable timers
-    u8 flags = irqs_pause();
+    flags = irqs_pause();
+
+    set_mode(M_USB_DISK);
 
     // clear screen
     for (size_t i = 0; i < 8; i++) {
         region_fill(&line[i], 0);
         region_draw(&line[i]);
     }
+}
 
-    // do USB
-    tele_usb_disk();
-
+void exit_usb_mode(void) {
     // renable teletype
     set_mode(M_LIVE);
     assign_main_event_handlers();
@@ -405,6 +414,7 @@ void handler_ScreenRefresh(int32_t data) {
         case M_LIVE: screen_dirty = screen_refresh_live(); break;
         case M_EDIT: screen_dirty = screen_refresh_edit(); break;
         case M_SCREENSAVER: screen_dirty = screen_refresh_screensaver(); break;
+        case M_USB_DISK: screen_dirty = screen_refresh_usbdisk(); break;
     }
 
     for (size_t i = 0; i < 8; i++)
@@ -507,6 +517,10 @@ void set_mode(tele_mode_t m) {
             set_screensaver_mode();
             mode = M_SCREENSAVER;
             break;
+        case M_USB_DISK:
+            set_usbdisk_mode();
+            mode = M_USB_DISK;
+            break;
     }
 }
 
@@ -516,8 +530,7 @@ void set_last_mode() {
 
     if (mode == M_SCREENSAVER)
         set_mode(last_mode);
-    else if (last_mode == M_LIVE || last_mode == M_EDIT ||
-             last_mode == M_PATTERN)
+    else if (last_mode == M_LIVE || last_mode == M_EDIT || last_mode == M_PATTERN || last_mode == M_USB_DISK)
         set_mode(last_mode);
     else
         set_mode(M_LIVE);
@@ -553,6 +566,7 @@ void process_keypress(uint8_t key, uint8_t mod_key, bool is_held_key) {
             break;
         case M_HELP: process_help_keys(key, mod_key, is_held_key); break;
         case M_SCREENSAVER: break;  // impossible
+        case M_USB_DISK: break;
     }
 }
 

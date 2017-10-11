@@ -30,10 +30,12 @@ typedef enum {
     M_PRESET_W,
     M_PRESET_R,
     M_HELP,
-    M_SCREENSAVER
+    M_SCREENSAVER,
+    M_USB_DISK
 } tele_mode_t;
 
 void set_mode(tele_mode_t mode);
 void set_last_mode(void);
+void exit_usb_mode(void);
 
 #endif

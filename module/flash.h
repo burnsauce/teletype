@@ -16,6 +16,12 @@ typedef const struct {
     char text[SCENE_TEXT_LINES][SCENE_TEXT_CHARS];
 } nvram_scene_t;
 
+typedef struct {
+    scene_script_t scripts[SCRIPT_COUNT];
+    scene_pattern_t patterns[PATTERN_COUNT];
+    char text[SCENE_TEXT_LINES][SCENE_TEXT_CHARS];
+} clone_scene_t;
+
 typedef const struct {
     nvram_scene_t scenes[SCENE_SLOTS];
     uint8_t last_scene;
