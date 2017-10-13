@@ -4,7 +4,6 @@
 
 #include "state.h"
 
-void tele_usb_disk(void);
 void process_usbdisk_button_press(bool);
 void process_usbdisk_knob(int32_t);
 bool screen_refresh_usbdisk(void);
